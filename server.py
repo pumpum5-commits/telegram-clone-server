@@ -3,10 +3,13 @@ import websockets
 import json
 import sqlite3
 import os
+import random
 
+# База данных
 conn = sqlite3.connect('chat.db', check_same_thread=False)
 cursor = conn.cursor()
 
+# Создаем таблицы
 cursor.execute('''
     CREATE TABLE IF NOT EXISTS users (
         username TEXT PRIMARY KEY,
@@ -14,6 +17,13 @@ cursor.execute('''
         avatar_url TEXT
     )
 ''')
+# Обновляем старую таблицу (добавляем колонку с паролем, если её нет)
+try:
+    cursor.execute("ALTER TABLE users ADD COLUMN password TEXT")
+    conn.commit()
+except sqlite3.OperationalError:
+    pass # Колонка уже существует
+
 cursor.execute('''
     CREATE TABLE IF NOT EXISTS messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -25,7 +35,18 @@ cursor.execute('''
 ''')
 conn.commit()
 
+# Словарь активных юзеров { websocket: "username" }
 connected_users = {}
+
+async def broadcast_online_status():
+    """Рассылает всем список пользователей, которые сейчас онлайн"""
+    online_list = list(connected_users.values())
+    msg = json.dumps({"type": "online_users", "users": online_list})
+    for ws in connected_users:
+        try:
+            await ws.send(msg)
+        except:
+            pass
 
 async def handle_client(websocket):
     username = None
@@ -33,21 +54,41 @@ async def handle_client(websocket):
         async for message in websocket:
             data = json.loads(message)
             
-            # --- ЛОГИН ---
+            # --- ЛОГИН И РЕГИСТРАЦИЯ ПО ПАРОЛЮ ---
             if data['type'] == 'login':
-                username = data['username']
-                display_name = data.get('display_name', username)
-                avatar_url = data.get('avatar_url', '')
+                display_name = data['display_name'].strip()
+                password = data['password']
                 
-                cursor.execute("INSERT OR IGNORE INTO users (username, display_name, avatar_url) VALUES (?, ?, ?)", 
-                               (username, display_name, avatar_url))
-                # Обновляем инфу на случай, если юзер зашел с новыми данными
-                cursor.execute("UPDATE users SET display_name = ?, avatar_url = ? WHERE username = ?", 
-                               (display_name, avatar_url, username))
-                conn.commit()
+                # Ищем пользователя по нику
+                cursor.execute("SELECT username, password, avatar_url FROM users WHERE display_name = ?", (display_name,))
+                user_row = cursor.fetchone()
+                
+                if user_row:
+                    # Пользователь найден, проверяем пароль
+                    if user_row[1] != password:
+                        await websocket.send(json.dumps({"type": "error", "message": "Неверный пароль или никнейм уже занят!"}))
+                        continue
+                    username = user_row[0]
+                    avatar_url = user_row[2]
+                else:
+                    # Регистрация нового пользователя
+                    # Генерируем временный username на основе ника
+                    base_username = '@' + display_name.lower().replace(' ', '')
+                    username = base_username
+                    while True:
+                        cursor.execute("SELECT username FROM users WHERE username = ?", (username,))
+                        if not cursor.fetchone(): break
+                        username = base_username + str(random.randint(1, 999))
+                    
+                    avatar_url = ""
+                    cursor.execute("INSERT INTO users (username, display_name, avatar_url, password) VALUES (?, ?, ?, ?)", 
+                                   (username, display_name, avatar_url, password))
+                    conn.commit()
+                
                 connected_users[websocket] = username
+                await broadcast_online_status() # Сообщаем всем, что мы зашли
                 
-                # Достаем историю вместе с никами и аватарками (JOIN)
+                # Отправляем историю и текущие данные юзера
                 cursor.execute("""
                     SELECT m.sender, m.receiver, m.text, u.display_name, u.avatar_url
                     FROM messages m
@@ -62,9 +103,15 @@ async def handle_client(websocket):
                     "sender_display": r[3] or r[0], "sender_avatar": r[4] or ""
                 } for r in history]
                 
-                await websocket.send(json.dumps({"type": "history", "messages": history_list}))
+                await websocket.send(json.dumps({
+                    "type": "login_success", 
+                    "username": username, 
+                    "display_name": display_name, 
+                    "avatar_url": avatar_url,
+                    "history": history_list
+                }))
             
-            # --- ИЗМЕНЕНИЕ ПРОФИЛЯ И ID ---
+            # --- ИЗМЕНЕНИЕ ПРОФИЛЯ ---
             elif data['type'] == 'update_credentials':
                 new_user = data.get('new_username')
                 new_nick = data.get('display_name')
@@ -76,12 +123,10 @@ async def handle_client(websocket):
                         await websocket.send(json.dumps({"type": "error", "message": "Этот ID уже занят!"}))
                         continue
                     
-                    # Меняем ID везде
                     cursor.execute("UPDATE users SET username = ?, display_name = ?, avatar_url = ? WHERE username = ?", (new_user, new_nick, new_avatar, username))
                     cursor.execute("UPDATE messages SET sender = ? WHERE sender = ?", (new_user, username))
                     cursor.execute("UPDATE messages SET receiver = ? WHERE receiver = ?", (new_user, username))
                     conn.commit()
-                    
                     connected_users[websocket] = new_user
                     username = new_user
                 else:
@@ -89,8 +134,9 @@ async def handle_client(websocket):
                     conn.commit()
                     
                 await websocket.send(json.dumps({"type": "credentials_updated", "username": username, "display_name": new_nick, "avatar_url": new_avatar}))
+                await broadcast_online_status()
 
-            # --- ПОИСК ПОЛЬЗОВАТЕЛЯ ---
+            # --- ПОИСК ---
             elif data['type'] == 'search_user':
                 cursor.execute("SELECT username, display_name, avatar_url FROM users WHERE username = ?", (data['target'],))
                 row = cursor.fetchone()
@@ -99,7 +145,7 @@ async def handle_client(websocket):
                 else:
                     await websocket.send(json.dumps({"type": "error", "message": "Пользователь не найден!"}))
 
-            # --- ОТПРАВКА СООБЩЕНИЯ ---
+            # --- СООБЩЕНИЯ ---
             elif data['type'] == 'message':
                 cursor.execute("INSERT INTO messages (sender, receiver, text) VALUES (?, ?, ?)", (username, data['to'], data['text']))
                 conn.commit()
@@ -124,11 +170,13 @@ async def handle_client(websocket):
     except websockets.exceptions.ConnectionClosed:
         pass
     finally:
-        if websocket in connected_users: del connected_users[websocket]
+        if websocket in connected_users: 
+            del connected_users[websocket]
+            await broadcast_online_status() # Обновляем статус при выходе
 
 async def main():
     port = int(os.environ.get("PORT", 10000))
-    async with websockets.serve(handle_client, "0.0.0.0", port, max_size=10**7): # Увеличили лимит для картинок
+    async with websockets.serve(handle_client, "0.0.0.0", port, max_size=10**7):
         await asyncio.Future()
 
 if __name__ == "__main__":
